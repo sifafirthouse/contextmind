@@ -259,4 +259,4 @@ function wire() {
   $('wipeBtn').onclick = function () { if (confirm('Delete ALL sessions and settings?')) { data = clone(DEFAULTS); pending = null; save(); render(); } };
   $('demoBtn').onclick = function () {
     frozen = true;                                      // stop normal saving so the fake "away time" is kept
-    data.lastS
+    data.lastS})();
