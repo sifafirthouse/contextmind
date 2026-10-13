@@ -265,7 +265,7 @@ function wire() {
     handleReturn(gap, data.lastSeen);                   // records the break and shows the lock screen
     frozen = false;
   };
-}
+
 
 // ===== 8. START =============================================================
 (function init() {
