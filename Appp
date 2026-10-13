@@ -273,5 +273,5 @@ function wire() {
   if (data.sessions.length && gap >= data.settings.breakSec * 1000) handleReturn(gap, data.lastSeen);
   else showLock();
 })();
-
+})();
 
