@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#3e104d">
+<title>ContextMind</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- LOCK SCREEN: blurred fake dashboard + password box. No real data is ever placed here. -->
+<section id="lock">
+  <div class="fakebg" aria-hidden="true">
+    <h1>ContextMind</h1>
+    <div class="fake"><div class="bar m"></div><div class="bar l"></div></div>
+    <div class="fake"><div class="fh"></div><div class="bar l"></div><div class="bar m"></div><div class="bar l"></div><div class="bar s"></div></div>
+    <div class="fake"><div class="fh"></div><div class="bar l"></div><div class="bar l"></div><div class="bar m"></div></div>
+  </div>
+  <div class="lockwrap">
+    <div class="lockcard">
+      <h2>ContextMind</h2>
+      <p id="lockMsg" class="muted"></p>
+      <div id="welcomeBanner" class="banner" style="display:none">Welcome back! Unlock to resume your work.</div>
+      <input type="password" id="pw" placeholder="Password" autocomplete="off">
+      <button id="unlockBtn" class="btn big">Unlock</button>
+      <p id="lockErr" class="err"></p>
+    </div>
+  </div>
+</section>
+
+<!-- DASHBOARD: filled by app.js only after the password is correct -->
+<main id="app" style="display:none"></main>
+
+<div id="toast"></div>
+<script>
+/* error display: shows any JavaScript error on screen (phone has no console) */
+window.onerror=function(m,src,l,c){var d=document.createElement('pre');d.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99;background:#fff;color:#b00;padding:8px;font-size:12px;white-space:pre-wrap;margin:0';d.textContent='JS error: '+m+' (line '+l+':'+c+')';document.body.appendChild(d);};
+</script>
+<script src="app.js"></script>
+</body>
+</html>
