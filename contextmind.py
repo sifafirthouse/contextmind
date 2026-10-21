@@ -73,6 +73,13 @@ def acquire_single_instance():
     return ctypes.get_last_error() != 183  # 183 = ERROR_ALREADY_EXISTS
 
 
+def show_error_box(text):
+    if IS_WIN:
+        ctypes.windll.user32.MessageBoxW(None, text, "ContextMind", 0x10)
+    else:
+        print(text)
+
+
 # ----------------------------------------------------------------- Windows API
 if IS_WIN:
     user32 = ctypes.windll.user32
@@ -171,8 +178,13 @@ class DB:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.path = path
         self.lock = threading.Lock()
-        self.con = sqlite3.connect(path, check_same_thread=False)
+        self.con = sqlite3.connect(path, check_same_thread=False, timeout=15)
         with self.lock:
+            try:
+                self.con.execute("PRAGMA journal_mode=WAL")
+                self.con.execute("PRAGMA busy_timeout=15000")
+            except sqlite3.OperationalError:
+                logging.exception("db pragma")
             self.con.executescript("""
             CREATE TABLE IF NOT EXISTS usage(
                 day TEXT, app TEXT, seconds REAL, PRIMARY KEY(day, app));
@@ -1241,8 +1253,14 @@ if __name__ == "__main__":
     setup_logging()
     if not acquire_single_instance():
         if "--minimized" not in sys.argv:
-            ctypes.windll.user32.MessageBoxW(
-                None, "ContextMind already running. Taskbar/tray-la paarunga.",
-                "ContextMind", 0x40)
+            show_error_box("ContextMind already running. Taskbar/tray-la paarunga.")
         sys.exit(0)
-    App(minimized="--minimized" in sys.argv).mainloop()
+    try:
+        app = App(minimized="--minimized" in sys.argv)
+    except sqlite3.OperationalError:
+        logging.exception("db open failed")
+        show_error_box("ContextMind database locked-aa irukku.\n"
+                       "Task Manager-la ContextMind / python process ellaam close pannitu "
+                       "thirumba open pannunga.")
+        sys.exit(1)
+    app.mainloop()
