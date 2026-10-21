@@ -12,6 +12,7 @@ import time
 import random
 import sqlite3
 import hashlib
+import logging
 import secrets
 import threading
 import ctypes
@@ -36,6 +37,19 @@ BG = "#f3eefc"
 ACCENT = "#6c3fc5"
 DARK = "#2e1a5c"
 LIGHT = "#e4d9f7"
+
+# Productivity-la count aagaadha system / helper processes
+SYSTEM_APPS = ("helpandtips.exe", "WerFault.exe", "rundll32.exe", "unknown")
+SYS_CLAUSE = "app NOT IN (%s)" % ",".join("?" * len(SYSTEM_APPS))
+
+UNLOCK_MAX_FAILS = 5
+UNLOCK_WAIT_SECS = 60
+
+
+def setup_logging():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    logging.basicConfig(filename=os.path.join(DATA_DIR, "contextmind.log"),
+                        level=logging.ERROR, format="%(asctime)s %(message)s")
 
 
 # ----------------------------------------------------------------- Windows API
@@ -76,6 +90,7 @@ if IS_WIN:
                 kernel32.CloseHandle(h)
             return exe, title, pid.value
         except Exception:
+            logging.exception("get_foreground")
             return None
 
     def idle_seconds():
@@ -85,14 +100,23 @@ if IS_WIN:
             if user32.GetLastInputInfo(ctypes.byref(info)):
                 return ((kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
         except Exception:
-            pass
+            logging.exception("idle_seconds")
         return 0.0
+
+    def os_lock_workstation():
+        try:
+            user32.LockWorkStation()
+        except Exception:
+            logging.exception("LockWorkStation")
 else:  # only so the file can be tested on non-Windows
     def get_foreground():
         return "demo.exe", "Demo window", 0
 
     def idle_seconds():
         return 0.0
+
+    def os_lock_workstation():
+        pass
 
 
 def fmt_secs(s):
@@ -247,7 +271,7 @@ class Tracker(threading.Thread):
                     self._since_save = 0.0
                     self.save_last_active()
             except Exception:
-                pass
+                logging.exception("tracker loop")
 
     def recent_context(self, n=6):
         seen, out = set(), []
@@ -328,6 +352,7 @@ class LockScreen(tk.Toplevel):
         self.snapshot = snapshot
         self.on_close = on_close
         self.entry = None
+        self.msg = None
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self._bg = self._make_bg(sw, sh)
 
@@ -363,6 +388,7 @@ class LockScreen(tk.Toplevel):
             tint = Image.new("RGB", (sw, sh), (46, 26, 92))
             return ImageTk.PhotoImage(Image.blend(big, tint, 0.5), master=self)
         except Exception:
+            logging.exception("lock background")
             return None
 
     def _placeholder(self, sw, sh):
@@ -381,7 +407,7 @@ class LockScreen(tk.Toplevel):
                 self.entry.focus_force()
             self.grab_set()
         except Exception:
-            pass
+            logging.exception("lock focus")
 
     def _clear(self):
         for w in self.card.winfo_children():
@@ -407,11 +433,24 @@ class LockScreen(tk.Toplevel):
         self.entry.focus_set()
 
     def try_unlock(self):
-        pw = self.entry.get()
-        if self.db.check_password(pw):
+        now = time.time()
+        wait = self.app.unlock_locked_until - now
+        if wait > 0:
+            self.msg.config(text="Too many attempts. Wait %ds" % int(wait))
+            self.entry.delete(0, "end")
+            return
+        if self.db.check_password(self.entry.get()):
+            self.app.unlock_fails = 0
             self.show_details()
         else:
-            self.msg.config(text="Wrong password")
+            self.app.unlock_fails += 1
+            if self.app.unlock_fails >= UNLOCK_MAX_FAILS:
+                self.app.unlock_locked_until = now + UNLOCK_WAIT_SECS
+                self.app.unlock_fails = 0
+                self.msg.config(text="Too many attempts. Wait %ds" % UNLOCK_WAIT_SECS)
+            else:
+                self.msg.config(text="Wrong password (%d/%d)" %
+                                (self.app.unlock_fails, UNLOCK_MAX_FAILS))
             self.entry.delete(0, "end")
 
     def show_details(self):
@@ -437,24 +476,27 @@ class LockScreen(tk.Toplevel):
                       "   Project   : %s" % (project or "-"),
                       "   Note      : %s" % ((note or "-").replace("\n", " ")[:120]),
                       "   Next step : %s" % ((nxt or "-").replace("\n", " ")[:120])]
-        files = self.db.q("SELECT app, title, seconds FROM titles WHERE day=? "
-                          "ORDER BY seconds DESC LIMIT 5", (date.today().isoformat(),))
+        today = date.today().isoformat()
+        files = self.db.q("SELECT app, title, seconds FROM titles WHERE day=? AND " + SYS_CLAUSE +
+                          " ORDER BY seconds DESC LIMIT 5", (today,) + SYSTEM_APPS)
         if files:
             lines += ["", "Files / windows used today"]
             for a, t, sec in files:
                 lines.append("   %s  -  %s  (%s)" % (a, t[:55], fmt_secs(sec)))
-        tot = self.db.q("SELECT SUM(seconds) FROM usage WHERE day=?", (date.today().isoformat(),))
+        tot = self.db.q("SELECT SUM(seconds) FROM usage WHERE day=? AND " + SYS_CLAUSE,
+                        (today,) + SYSTEM_APPS)
         lines += ["", "Tracked today: %s" % fmt_secs(tot[0][0] or 0)]
         tk.Label(c, text="\n".join(lines), bg=DARK, fg="white", justify="left", anchor="w",
                  font=("Consolas", 11), wraplength=620).pack(anchor="w")
-        tk.Button(c, text="Continue", width=16, bg=ACCENT, fg="white", relief="flat",
-                  font=("Segoe UI", 11, "bold"), command=self.close).pack(pady=(16, 0))
+        tk.Button(c, text="Continue to ContextMind", width=22, bg=ACCENT, fg="white",
+                  relief="flat", font=("Segoe UI", 11, "bold"),
+                  command=self.close).pack(pady=(16, 0))
 
     def close(self):
         try:
             self.grab_release()
         except Exception:
-            pass
+            logging.exception("grab_release")
         self.destroy()
         self.on_close()
 
@@ -474,6 +516,8 @@ class App(tk.Tk):
         self.tracker.start()
         self.lock_win = None
         self._n = 0
+        self.unlock_fails = 0
+        self.unlock_locked_until = 0.0
 
         self._style()
         self._build()
@@ -579,7 +623,8 @@ class App(tk.Tk):
 
     def refresh_dashboard(self):
         today = date.today().isoformat()
-        rows = self.db.q("SELECT app, seconds FROM usage WHERE day=? ORDER BY seconds DESC", (today,))
+        rows = self.db.q("SELECT app, seconds FROM usage WHERE day=? AND " + SYS_CLAUSE +
+                         " ORDER BY seconds DESC", (today,) + SYSTEM_APPS)
         total = sum(r[1] for r in rows)
         self.lbl_total.config(text=fmt_secs(total))
         self.lbl_apps.config(text=str(len(rows)))
@@ -702,11 +747,12 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Resume - " + (project or "checkpoint"))
         win.configure(bg=BG)
-        win.geometry("560x460")
+        win.geometry("560x480")
         txt = tk.Text(win, wrap="word", font=("Segoe UI", 10), bg="white", padx=10, pady=10)
         txt.pack(fill="both", expand=True, padx=10, pady=10)
-        body = "Project : %s\nSaved   : %s\n\nNOTE\n%s\n\nNEXT STEP\n%s\n\nAPPS OPEN AT THAT TIME\n" % (
-            project, ts, note or "-", nxt or "-")
+        body = ("Shows the context you saved to resume work. It does not reopen apps.\n\n"
+                "Project : %s\nSaved   : %s\n\nNOTE\n%s\n\nNEXT STEP\n%s\n\nAPPS OPEN AT THAT TIME\n" % (
+                    project, ts, note or "-", nxt or "-"))
         for a in apps:
             body += "  - %s  |  %s\n" % (a.get("app"), a.get("title"))
         if not apps:
@@ -753,9 +799,10 @@ class App(tk.Tk):
         for i in self.h_tree.get_children():
             self.h_tree.delete(i)
         rows = self.db.q(
-            "SELECT day, app, seconds FROM usage WHERE day>=? AND day<=? AND app LIKE ? "
-            "ORDER BY day DESC, seconds DESC",
-            (self.h_from.get().strip(), self.h_to.get().strip(), "%" + self.h_app.get().strip() + "%"))
+            "SELECT day, app, seconds FROM usage WHERE day>=? AND day<=? AND app LIKE ? AND " +
+            SYS_CLAUSE + " ORDER BY day DESC, seconds DESC",
+            (self.h_from.get().strip(), self.h_to.get().strip(),
+             "%" + self.h_app.get().strip() + "%") + SYSTEM_APPS)
         for d, a, s in rows:
             self.h_tree.insert("", "end", values=(d, a, fmt_secs(s)))
         self.h_total.config(text="Total: " + fmt_secs(sum(r[2] for r in rows)))
@@ -779,6 +826,8 @@ class App(tk.Tk):
                    command=self.load_files).grid(row=1, column=3, padx=8)
         self.f_total = ttk.Label(f, text="", style="H.TLabel")
         self.f_total.pack(anchor="w", padx=12)
+        self.f_warn = ttk.Label(f, text="", foreground="#b03040")
+        self.f_warn.pack(anchor="w", padx=12)
         self.f_tree = ttk.Treeview(f, columns=("day", "app", "file", "time"), show="headings")
         for c, w, t in (("day", 100, "Day"), ("app", 140, "App"),
                         ("file", 470, "File / window name"), ("time", 90, "Time")):
@@ -790,11 +839,17 @@ class App(tk.Tk):
     def load_files(self):
         for i in self.f_tree.get_children():
             self.f_tree.delete(i)
+        if self.db.get("track_titles", "1") == "1":
+            self.f_warn.config(text="")
+        else:
+            self.f_warn.config(text="File names recording is OFF - Files tab incomplete. "
+                                    "Turn it on in Settings.")
         s = "%" + self.f_text.get().strip() + "%"
         rows = self.db.q(
             "SELECT day, app, title, seconds FROM titles WHERE day>=? AND day<=? "
-            "AND (app LIKE ? OR title LIKE ?) ORDER BY day DESC, seconds DESC LIMIT 1000",
-            (self.f_from.get().strip(), self.f_to.get().strip(), s, s))
+            "AND (app LIKE ? OR title LIKE ?) AND " + SYS_CLAUSE +
+            " ORDER BY day DESC, seconds DESC LIMIT 1000",
+            (self.f_from.get().strip(), self.f_to.get().strip(), s, s) + SYSTEM_APPS)
         for d, a, t, sec in rows:
             self.f_tree.insert("", "end", values=(d, a, t, fmt_secs(sec)))
         self.f_total.config(text="%d files / windows" % len(rows))
@@ -841,6 +896,10 @@ class App(tk.Tk):
         ttk.Label(row, text="minutes").pack(side="left")
         self.lock_min.trace_add("write", lambda *a: self.save_lock_settings())
 
+        self.oslock_var = tk.BooleanVar(value=self.db.get("os_lock", "0") == "1")
+        ttk.Checkbutton(f, text="Also lock Windows when idle (stronger, recommended)",
+                        variable=self.oslock_var, command=self.save_oslock_setting).pack(**pad)
+
         ttk.Label(f, text="Export / Backup", style="H.TLabel").pack(**pad)
         row = ttk.Frame(f)
         row.pack(**pad)
@@ -849,6 +908,8 @@ class App(tk.Tk):
         ttk.Button(row, text="Export files (CSV)", command=self.export_titles).pack(side="left", padx=6)
         ttk.Button(row, text="Export all (JSON)", command=self.export_json).pack(side="left")
         ttk.Button(row, text="Backup database", command=self.backup_db).pack(side="left", padx=6)
+        ttk.Label(f, text="Exports and backups contain window titles. Keep them private.",
+                  foreground="#b03040").pack(**pad)
 
         ttk.Label(f, text="Window X button minimizes the app (tracking continues).",
                   foreground="#7a6a9a").pack(**pad)
@@ -876,10 +937,14 @@ class App(tk.Tk):
         self.db.set("lock_idle_minutes", m)
         self.db.set("lock_idle", "1" if self.lock_en.get() else "0")
 
+    def save_oslock_setting(self):
+        self.db.set("os_lock", "1" if self.oslock_var.get() else "0")
+
     def save_title_setting(self):
         on = self.title_var.get()
         self.db.set("track_titles", "1" if on else "0")
         self.tracker.track_titles = on
+        self.load_files()
 
     def toggle_autostart(self):
         on = self.auto_var.get()
@@ -907,6 +972,7 @@ class App(tk.Tk):
             winreg.CloseKey(key)
             self.db.set("autostart", "1" if on else "0")
         except Exception as ex:
+            logging.exception("autostart")
             messagebox.showerror("ContextMind", "Startup setting failed: %s" % ex)
             self.auto_var.set(not on)
 
@@ -967,6 +1033,7 @@ class App(tk.Tk):
         try:
             self.lock_win = LockScreen(self, reason, snap, done)
         except Exception:
+            logging.exception("show_lock")
             self.lock_win = None
             if reason == "startup":  # never leave the user without a window
                 self.deiconify()
@@ -996,7 +1063,7 @@ class App(tk.Tk):
             w.writerow(["id", "time", "project", "note", "next_step", "context"])
             for r in self.db.q("SELECT id,ts,project,note,next_step,context FROM checkpoints"):
                 w.writerow(r)
-        messagebox.showinfo("ContextMind", "Exported.")
+        messagebox.showinfo("ContextMind", "Exported.\nThis file contains window titles. Keep it private.")
 
     def export_titles(self):
         p = self._save_dialog("contextmind_files.csv", ".csv")
@@ -1007,7 +1074,7 @@ class App(tk.Tk):
             w.writerow(["day", "app", "file_or_window", "seconds", "time"])
             for d, a, t, sec in self.db.q("SELECT day,app,title,seconds FROM titles ORDER BY day,app"):
                 w.writerow([d, a, t, int(sec), fmt_secs(sec)])
-        messagebox.showinfo("ContextMind", "Exported.")
+        messagebox.showinfo("ContextMind", "Exported.\nThis file contains window titles. Keep it private.")
 
     def export_json(self):
         p = self._save_dialog("contextmind_all.json", ".json")
@@ -1024,14 +1091,14 @@ class App(tk.Tk):
                          self.db.q("SELECT day,app,title,seconds FROM titles")]
         with open(p, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
-        messagebox.showinfo("ContextMind", "Exported.")
+        messagebox.showinfo("ContextMind", "Exported.\nThis file contains window titles. Keep it private.")
 
     def backup_db(self):
         p = self._save_dialog("contextmind_backup_%s.db" % date.today().isoformat(), ".db")
         if not p:
             return
         self.db.backup_to(p)
-        messagebox.showinfo("ContextMind", "Backup saved.")
+        messagebox.showinfo("ContextMind", "Backup saved.\nThis file contains window titles. Keep it private.")
 
     # loop / quit
     def _tick(self):
@@ -1041,11 +1108,13 @@ class App(tk.Tk):
                     and self.db.has_password()):
                 limit = int(self.db.get("lock_idle_minutes", "2")) * 60
                 if idle_seconds() > limit:
+                    if self.db.get("os_lock", "0") == "1":
+                        os_lock_workstation()
                     self.show_lock("idle")
             if self._n % 3 == 0 and self.lock_win is None and self.state() == "normal":
                 self.refresh_dashboard()
         except Exception:
-            pass
+            logging.exception("tick")
         finally:
             self.after(2000, self._tick)
 
@@ -1057,4 +1126,5 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    setup_logging()
     App(minimized="--minimized" in sys.argv).mainloop()
