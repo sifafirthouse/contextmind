@@ -52,11 +52,25 @@ OWN_APPS = {"contextmind.exe", "python.exe", "pythonw.exe", "py.exe"}
 UNLOCK_MAX_FAILS = 5
 UNLOCK_WAIT_SECS = 60
 
+_INSTANCE_MUTEX = None  # global-aa irukkanum, illana GC aagi mutex release aagidum
+
 
 def setup_logging():
     os.makedirs(DATA_DIR, exist_ok=True)
     logging.basicConfig(filename=os.path.join(DATA_DIR, "contextmind.log"),
                         level=logging.ERROR, format="%(asctime)s %(message)s")
+
+
+def acquire_single_instance():
+    """Oru session-la oru ContextMind dhaan run aaga anumathi. True = naan dhaan first."""
+    global _INSTANCE_MUTEX
+    if not IS_WIN:
+        return True
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = wt.HANDLE
+    k32.CreateMutexW.argtypes = [wt.LPVOID, wt.BOOL, wt.LPCWSTR]
+    _INSTANCE_MUTEX = k32.CreateMutexW(None, False, "Local\\ContextMindSingleInstance")
+    return ctypes.get_last_error() != 183  # 183 = ERROR_ALREADY_EXISTS
 
 
 # ----------------------------------------------------------------- Windows API
@@ -576,8 +590,6 @@ class App(tk.Tk):
         self._n = 0
         self.unlock_fails = 0
         self.unlock_locked_until = 0.0
-        self._idle_lock_triggered = False
-        self._closing = False
 
         self._style()
         self._build()
@@ -647,7 +659,8 @@ class App(tk.Tk):
         self.nb.add(self.tab_set, text="Settings")
         self._build_dash()
         self._build_cp()
-                self._build_files()
+        self._build_hist()
+        self._build_files()
         self._build_settings()
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab)
 
@@ -1104,21 +1117,19 @@ class App(tk.Tk):
             messagebox.showerror("ContextMind", "Wrong password.")
 
     def show_lock(self, reason):
-        if self._closing or self.lock_win is not None:
+        if self.lock_win is not None:
             return
         if not self.db.has_password():
             if reason == "manual":
                 messagebox.showinfo("ContextMind", "Please set a password first.")
             return
-
         snap = self.prev_last if reason == "startup" else (self.tracker.snapshot() or self.prev_last)
         was_normal = self.state() == "normal"
-        self.withdraw()
+
+        self.withdraw()  # dashboard lock nerathula hide
 
         def done():
             self.lock_win = None
-            if self._closing:
-                return
             if reason == "startup":
                 self.deiconify()
                 if self.minimized:
@@ -1127,13 +1138,11 @@ class App(tk.Tk):
                 self.deiconify()
 
         try:
-            lock = LockScreen(self, reason, snap, done)
-            self.lock_win = lock
+            self.lock_win = LockScreen(self, reason, snap, done)
         except Exception:
             logging.exception("show_lock")
             self.lock_win = None
-            if not self._closing:
-                self.deiconify()
+            self.deiconify()
 
     # export / backup
     def _save_dialog(self, name, ext):
@@ -1199,8 +1208,6 @@ class App(tk.Tk):
 
     # loop / quit
     def _tick(self):
-        if self._closing:
-            return
         try:
             self._n += 1
             if self.lock_win is not None:
@@ -1209,51 +1216,33 @@ class App(tk.Tk):
                     self.lock_win.attributes("-topmost", True)
                 except tk.TclError:
                     self.lock_win = None
-
-            if self.db.get("lock_idle", "1") == "1" and self.db.has_password():
+            if (self.lock_win is None and self.db.get("lock_idle", "1") == "1"
+                    and self.db.has_password()):
                 limit = int(self.db.get("lock_idle_minutes", "2")) * 60
-                idle = idle_seconds()
-                if idle <= limit:
-                    # User activity resets the one-lock-per-idle-period latch.
-                    self._idle_lock_triggered = False
-                elif self.lock_win is None and not self._idle_lock_triggered:
-                    # Set before opening the window so the next tick cannot open
-                    # another lock screen for the same idle period.
-                    self._idle_lock_triggered = True
+                if idle_seconds() > limit:
                     if self.db.get("os_lock", "0") == "1":
                         os_lock_workstation()
                     self.show_lock("idle")
-            else:
-                self._idle_lock_triggered = False
-
             if self._n % 3 == 0 and self.lock_win is None and self.state() == "normal":
                 self.refresh_dashboard()
         except Exception:
             logging.exception("tick")
         finally:
-            if not self._closing:
-                try:
-                    self.after(2000, self._tick)
-                except tk.TclError:
-                    pass
+            self.after(2000, self._tick)
 
     def quit_app(self):
         if messagebox.askyesno("ContextMind", "Exit ContextMind? Tracking will stop."):
-            self._closing = True
             self.tracker.save_last_active()
             self.tracker.stop()
-            if self.lock_win is not None:
-                try:
-                    self.lock_win._closed = True
-                    self.lock_win._cancel_job()
-                    self.lock_win.grab_release()
-                    self.lock_win.destroy()
-                except (tk.TclError, AttributeError):
-                    pass
-                self.lock_win = None
             self.destroy()
 
 
 if __name__ == "__main__":
     setup_logging()
-        self._build_hist()
+    if not acquire_single_instance():
+        if "--minimized" not in sys.argv:
+            ctypes.windll.user32.MessageBoxW(
+                None, "ContextMind already running. Taskbar/tray-la paarunga.",
+                "ContextMind", 0x40)
+        sys.exit(0)
+    App(minimized="--minimized" in sys.argv).mainloop()
