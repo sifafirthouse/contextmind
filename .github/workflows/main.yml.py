@@ -1,0 +1,36 @@
+name: Build ContextMind
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller pillow
+
+      - name: Find contextmind.py
+        shell: pwsh
+        run: |
+          Write-Host "Files in repository:"
+          Get-ChildItem -Recurse -File | Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' } | ForEach-Object { Write-Host $_.FullName }
+          $f = Get-ChildItem -Recurse -File | Where-Object { $_.Name -ieq 'contextmind.py' } | Select-Object -First 1
+          if (-not $f) { Write-Host "ERROR: contextmind.py not found in repository"; exit 1 }
+          Write-Host "Using script: $($f.FullName)"
+          "SCRIPT=$($f.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build EXE
+        shell: pwsh
+        run: pyinstaller --noconsole --onefile --name ContextMind "$env:SCRIPT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ContextMind-exe
+          path: dist/ContextMind.exe
