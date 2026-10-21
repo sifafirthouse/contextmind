@@ -134,6 +134,8 @@ class DB:
             CREATE TABLE IF NOT EXISTS checkpoints(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, project TEXT,
                 note TEXT, next_step TEXT, context TEXT);
+            CREATE TABLE IF NOT EXISTS titles(
+                day TEXT, app TEXT, title TEXT, seconds REAL, PRIMARY KEY(day, app, title));
             CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
             """)
             self.con.commit()
@@ -158,6 +160,11 @@ class DB:
         self.x("INSERT INTO usage(day,app,seconds) VALUES(?,?,?) "
                "ON CONFLICT(day,app) DO UPDATE SET seconds=seconds+excluded.seconds",
                (day, app, secs))
+
+    def add_title(self, day, app, title, secs):
+        self.x("INSERT INTO titles(day,app,title,seconds) VALUES(?,?,?,?) "
+               "ON CONFLICT(day,app,title) DO UPDATE SET seconds=seconds+excluded.seconds",
+               (day, app, title, secs))
 
     def backup_to(self, dest):
         with self.lock:
@@ -196,6 +203,7 @@ class Tracker(threading.Thread):
         self.db = db
         self.paused = db.get("paused", "0") == "1"
         self.idle_limit = int(db.get("idle_minutes", "3")) * 60
+        self.track_titles = db.get("track_titles", "1") == "1"
         self.current = ("-", "-")
         self.is_idle = False
         self.last_active_ts = None
@@ -232,6 +240,8 @@ class Tracker(threading.Thread):
                     self.recent.append(item)
                 self.last_active_ts = now
                 self.db.add_usage(date.today().isoformat(), app, dt)
+                if self.track_titles and title.strip():
+                    self.db.add_title(date.today().isoformat(), app, title.strip()[:150], dt)
                 self._since_save += dt
                 if self._since_save >= 10:
                     self._since_save = 0.0
@@ -427,6 +437,12 @@ class LockScreen(tk.Toplevel):
                       "   Project   : %s" % (project or "-"),
                       "   Note      : %s" % ((note or "-").replace("\n", " ")[:120]),
                       "   Next step : %s" % ((nxt or "-").replace("\n", " ")[:120])]
+        files = self.db.q("SELECT app, title, seconds FROM titles WHERE day=? "
+                          "ORDER BY seconds DESC LIMIT 5", (date.today().isoformat(),))
+        if files:
+            lines += ["", "Files / windows used today"]
+            for a, t, sec in files:
+                lines.append("   %s  -  %s  (%s)" % (a, t[:55], fmt_secs(sec)))
         tot = self.db.q("SELECT SUM(seconds) FROM usage WHERE day=?", (date.today().isoformat(),))
         lines += ["", "Tracked today: %s" % fmt_secs(tot[0][0] or 0)]
         tk.Label(c, text="\n".join(lines), bg=DARK, fg="white", justify="left", anchor="w",
@@ -518,14 +534,17 @@ class App(tk.Tk):
         self.tab_dash = ttk.Frame(nb)
         self.tab_cp = ttk.Frame(nb)
         self.tab_hist = ttk.Frame(nb)
+        self.tab_files = ttk.Frame(nb)
         self.tab_set = ttk.Frame(nb)
         nb.add(self.tab_dash, text="Dashboard")
         nb.add(self.tab_cp, text="Checkpoints")
         nb.add(self.tab_hist, text="Usage History")
+        nb.add(self.tab_files, text="Files Used")
         nb.add(self.tab_set, text="Settings")
         self._build_dash()
         self._build_cp()
         self._build_hist()
+        self._build_files()
         self._build_settings()
 
     # Dashboard
@@ -638,7 +657,7 @@ class App(tk.Tk):
         note = self.cp_note.get("1.0", "end").strip()
         nxt = self.cp_next.get("1.0", "end").strip()
         if not project and not note:
-            messagebox.showwarning("ContextMind", "Work name or note enter pannunga.")
+            messagebox.showwarning("ContextMind", "Please enter a project name or a note.")
             return
         ctx = json.dumps(self.tracker.recent_context())
         self.db.x("INSERT INTO checkpoints(ts,project,note,next_step,context) VALUES(?,?,?,?,?)",
@@ -664,7 +683,7 @@ class App(tk.Tk):
     def _selected_cp(self):
         sel = self.cp_tree.selection()
         if not sel:
-            messagebox.showinfo("ContextMind", "Oru checkpoint select pannunga.")
+            messagebox.showinfo("ContextMind", "Please select a checkpoint first.")
             return None
         return self.cp_tree.item(sel[0])["values"][0]
 
@@ -741,6 +760,45 @@ class App(tk.Tk):
             self.h_tree.insert("", "end", values=(d, a, fmt_secs(s)))
         self.h_total.config(text="Total: " + fmt_secs(sum(r[2] for r in rows)))
 
+    # Files / windows used
+    def _build_files(self):
+        f = self.tab_files
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", padx=12, pady=10)
+        today = date.today().isoformat()
+        self.f_from = tk.StringVar(value=today)
+        self.f_to = tk.StringVar(value=today)
+        self.f_text = tk.StringVar()
+        ttk.Label(bar, text="From (YYYY-MM-DD)").grid(row=0, column=0, sticky="w")
+        ttk.Label(bar, text="To").grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(bar, text="App or file name contains").grid(row=0, column=2, sticky="w", padx=8)
+        ttk.Entry(bar, textvariable=self.f_from, width=14).grid(row=1, column=0)
+        ttk.Entry(bar, textvariable=self.f_to, width=14).grid(row=1, column=1, padx=8)
+        ttk.Entry(bar, textvariable=self.f_text, width=28).grid(row=1, column=2, padx=8)
+        ttk.Button(bar, text="Show", style="Accent.TButton",
+                   command=self.load_files).grid(row=1, column=3, padx=8)
+        self.f_total = ttk.Label(f, text="", style="H.TLabel")
+        self.f_total.pack(anchor="w", padx=12)
+        self.f_tree = ttk.Treeview(f, columns=("day", "app", "file", "time"), show="headings")
+        for c, w, t in (("day", 100, "Day"), ("app", 140, "App"),
+                        ("file", 470, "File / window name"), ("time", 90, "Time")):
+            self.f_tree.heading(c, text=t)
+            self.f_tree.column(c, width=w, anchor="w")
+        self.f_tree.pack(fill="both", expand=True, padx=12, pady=8)
+        self.load_files()
+
+    def load_files(self):
+        for i in self.f_tree.get_children():
+            self.f_tree.delete(i)
+        s = "%" + self.f_text.get().strip() + "%"
+        rows = self.db.q(
+            "SELECT day, app, title, seconds FROM titles WHERE day>=? AND day<=? "
+            "AND (app LIKE ? OR title LIKE ?) ORDER BY day DESC, seconds DESC LIMIT 1000",
+            (self.f_from.get().strip(), self.f_to.get().strip(), s, s))
+        for d, a, t, sec in rows:
+            self.f_tree.insert("", "end", values=(d, a, t, fmt_secs(sec)))
+        self.f_total.config(text="%d files / windows" % len(rows))
+
     # Settings
     def _build_settings(self):
         f = self.tab_set
@@ -761,6 +819,9 @@ class App(tk.Tk):
         self.auto_var = tk.BooleanVar(value=self.db.get("autostart", "0") == "1")
         ttk.Checkbutton(f, text="Start ContextMind when Windows starts",
                         variable=self.auto_var, command=self.toggle_autostart).pack(**pad)
+        self.title_var = tk.BooleanVar(value=self.db.get("track_titles", "1") == "1")
+        ttk.Checkbutton(f, text="Record file / window names (shown in the Files Used tab)",
+                        variable=self.title_var, command=self.save_title_setting).pack(**pad)
 
         ttk.Label(f, text="Password & lock screen", style="H.TLabel").pack(**pad)
         row = ttk.Frame(f)
@@ -785,6 +846,7 @@ class App(tk.Tk):
         row.pack(**pad)
         ttk.Button(row, text="Export usage (CSV)", command=self.export_usage).pack(side="left")
         ttk.Button(row, text="Export checkpoints (CSV)", command=self.export_cp).pack(side="left", padx=6)
+        ttk.Button(row, text="Export files (CSV)", command=self.export_titles).pack(side="left", padx=6)
         ttk.Button(row, text="Export all (JSON)", command=self.export_json).pack(side="left")
         ttk.Button(row, text="Backup database", command=self.backup_db).pack(side="left", padx=6)
 
@@ -814,10 +876,15 @@ class App(tk.Tk):
         self.db.set("lock_idle_minutes", m)
         self.db.set("lock_idle", "1" if self.lock_en.get() else "0")
 
+    def save_title_setting(self):
+        on = self.title_var.get()
+        self.db.set("track_titles", "1" if on else "0")
+        self.tracker.track_titles = on
+
     def toggle_autostart(self):
         on = self.auto_var.get()
         if not IS_WIN:
-            messagebox.showinfo("ContextMind", "Windows-la mattum work aagum.")
+            messagebox.showinfo("ContextMind", "This option works on Windows only.")
             self.auto_var.set(False)
             return
         try:
@@ -849,7 +916,7 @@ class App(tk.Tk):
             return
         self.db.set("asked_pw", "1")
         if messagebox.askyesno("ContextMind",
-                               "Lock screen use panna password venum.\nIppove password set pannalaamaa?"):
+                               "A password is needed for the lock screen.\nDo you want to set one now?"):
             self.change_password()
 
     def change_password(self):
@@ -863,7 +930,7 @@ class App(tk.Tk):
             return
         p2 = ask_password(self, "ContextMind", "Confirm new password:")
         if p1 != p2:
-            messagebox.showerror("ContextMind", "Passwords match aagala.")
+            messagebox.showerror("ContextMind", "Passwords do not match.")
             return
         self.db.set_password(p1)
         messagebox.showinfo("ContextMind", "Password set.")
@@ -883,7 +950,7 @@ class App(tk.Tk):
             return
         if not self.db.has_password():
             if reason == "manual":
-                messagebox.showinfo("ContextMind", "Mudhalla password set pannunga.")
+                messagebox.showinfo("ContextMind", "Please set a password first.")
             return
         if reason == "startup":
             snap = self.prev_last
@@ -931,6 +998,17 @@ class App(tk.Tk):
                 w.writerow(r)
         messagebox.showinfo("ContextMind", "Exported.")
 
+    def export_titles(self):
+        p = self._save_dialog("contextmind_files.csv", ".csv")
+        if not p:
+            return
+        with open(p, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow(["day", "app", "file_or_window", "seconds", "time"])
+            for d, a, t, sec in self.db.q("SELECT day,app,title,seconds FROM titles ORDER BY day,app"):
+                w.writerow([d, a, t, int(sec), fmt_secs(sec)])
+        messagebox.showinfo("ContextMind", "Exported.")
+
     def export_json(self):
         p = self._save_dialog("contextmind_all.json", ".json")
         if not p:
@@ -942,6 +1020,8 @@ class App(tk.Tk):
                                  next_step=r[4], context=r[5]) for r in
                             self.db.q("SELECT id,ts,project,note,next_step,context FROM checkpoints")],
         }
+        data["files"] = [dict(day=d, app=a, title=t, seconds=sec) for d, a, t, sec in
+                         self.db.q("SELECT day,app,title,seconds FROM titles")]
         with open(p, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
         messagebox.showinfo("ContextMind", "Exported.")
@@ -970,7 +1050,7 @@ class App(tk.Tk):
             self.after(2000, self._tick)
 
     def quit_app(self):
-        if messagebox.askyesno("ContextMind", "Exit? Tracking nillu pogum."):
+        if messagebox.askyesno("ContextMind", "Exit ContextMind? Tracking will stop."):
             self.tracker.save_last_active()
             self.tracker.stop()
             self.destroy()
