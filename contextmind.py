@@ -38,11 +38,13 @@ ACCENT = "#6c3fc5"
 DARK = "#2e1a5c"
 LIGHT = "#e4d9f7"
 
+IDLE_BUCKET = "idle"  # idle time separate-aa store aagum, productivity total-la serkkaadhu
+
 # Productivity-la count aagaadha system / helper / own processes (lowercase)
 SYSTEM_APPS = (
     "helpandtips.exe", "werfault.exe", "rundll32.exe", "unknown",
     "taskmgr.exe", "systemsettings.exe", "py.exe", "python.exe",
-    "pythonw.exe", "contextmind.exe",
+    "pythonw.exe", "contextmind.exe", IDLE_BUCKET,
 )
 SYS_CLAUSE = "LOWER(app) NOT IN (%s)" % ",".join("?" * len(SYSTEM_APPS))
 OWN_APPS = {"contextmind.exe", "python.exe", "pythonw.exe", "py.exe"}
@@ -255,8 +257,14 @@ class Tracker(threading.Thread):
                 continue
             try:
                 self.is_idle = idle_seconds() > self.idle_limit
+                today = date.today().isoformat()
+
                 if self.is_idle:
+                    # Idle time separate bucket-la pogum. last_active_ts update aagaadhu,
+                    # so lock snapshot-la idle-ku munnadi irundha real app dhaan varum.
+                    self.db.add_usage(today, IDLE_BUCKET, dt)
                     continue
+
                 fg = get_foreground()
                 if not fg:
                     continue
@@ -264,12 +272,12 @@ class Tracker(threading.Thread):
                 # ContextMind-oda own windows / lock screen / python process skip
                 if pid == self.own_pid or app.lower() in OWN_APPS:
                     continue
+
                 item = (app, title)
                 self.current = item
                 if not self.recent or self.recent[-1] != item:
                     self.recent.append(item)
                 self.last_active_ts = now
-                today = date.today().isoformat()
                 self.db.add_usage(today, app, dt)
                 if self.track_titles and title.strip():
                     self.db.add_title(today, app, title.strip()[:150], dt)
@@ -360,6 +368,9 @@ class LockScreen(tk.Toplevel):
         self.on_close = on_close
         self.entry = None
         self.msg = None
+        self.unlock_btn = None
+        self._lock_job = None
+        self._closed = False
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self._bg = self._make_bg(sw, sh)
 
@@ -417,8 +428,17 @@ class LockScreen(tk.Toplevel):
             logging.exception("lock focus")
 
     def _clear(self):
+        self._cancel_job()
         for w in self.card.winfo_children():
             w.destroy()
+
+    def _cancel_job(self):
+        if self._lock_job is not None:
+            try:
+                self.after_cancel(self._lock_job)
+            except tk.TclError:
+                pass
+            self._lock_job = None
 
     # views
     def show_login(self):
@@ -434,31 +454,57 @@ class LockScreen(tk.Toplevel):
         self.entry.pack(pady=4)
         self.msg = tk.Label(c, text="", bg=DARK, fg="#ff9aa2", font=("Segoe UI", 10))
         self.msg.pack(pady=2)
-        tk.Button(c, text="Unlock", width=14, bg=ACCENT, fg="white", relief="flat",
-                  font=("Segoe UI", 11, "bold"), command=self.try_unlock).pack(pady=(8, 0))
+        self.unlock_btn = tk.Button(c, text="Unlock", width=14, bg=ACCENT, fg="white",
+                                    relief="flat", font=("Segoe UI", 11, "bold"),
+                                    command=self.try_unlock)
+        self.unlock_btn.pack(pady=(8, 0))
         self.entry.bind("<Return>", lambda e: self.try_unlock())
         self.entry.focus_set()
+        self._refresh_lockout()  # lockout active-aa irundha countdown start aagum
+
+    # lockout countdown (per-second update)
+    def _lockout_left(self):
+        return max(0, int(self.app.unlock_locked_until - time.time() + 0.999))
+
+    def _refresh_lockout(self):
+        if self._closed or self.entry is None:
+            return
+        try:
+            left = self._lockout_left()
+            if left > 0:
+                self.entry.delete(0, "end")
+                self.entry.config(state="disabled")
+                self.unlock_btn.config(state="disabled")
+                self.msg.config(text="Too many wrong attempts. Try again in %ds" % left)
+                self._lock_job = self.after(1000, self._refresh_lockout)
+            else:
+                self._lock_job = None
+                if str(self.entry.cget("state")) == "disabled":
+                    # lockout mudinjadhu: prompt thirumba varum
+                    self.entry.config(state="normal")
+                    self.unlock_btn.config(state="normal")
+                    self.msg.config(text="You can try again now")
+                    self.entry.focus_set()
+        except tk.TclError:
+            pass
 
     def try_unlock(self):
-        now = time.time()
-        wait = self.app.unlock_locked_until - now
-        if wait > 0:
-            self.msg.config(text="Too many attempts. Wait %ds" % int(wait))
-            self.entry.delete(0, "end")
+        if self._lockout_left() > 0:
+            self._refresh_lockout()
             return
         if self.db.check_password(self.entry.get()):
             self.app.unlock_fails = 0
             self.show_details()
+            return
+        self.app.unlock_fails += 1
+        self.entry.delete(0, "end")
+        if self.app.unlock_fails >= UNLOCK_MAX_FAILS:
+            self.app.unlock_fails = 0
+            self.app.unlock_locked_until = time.time() + UNLOCK_WAIT_SECS
+            self._refresh_lockout()
         else:
-            self.app.unlock_fails += 1
-            if self.app.unlock_fails >= UNLOCK_MAX_FAILS:
-                self.app.unlock_locked_until = now + UNLOCK_WAIT_SECS
-                self.app.unlock_fails = 0
-                self.msg.config(text="Too many attempts. Wait %ds" % UNLOCK_WAIT_SECS)
-            else:
-                self.msg.config(text="Wrong password (%d/%d)" %
-                                (self.app.unlock_fails, UNLOCK_MAX_FAILS))
-            self.entry.delete(0, "end")
+            self.msg.config(text="Wrong password (%d/%d)" %
+                            (self.app.unlock_fails, UNLOCK_MAX_FAILS))
 
     def show_details(self):
         self._clear()
@@ -492,7 +538,10 @@ class LockScreen(tk.Toplevel):
                 lines.append("   %s  -  %s  (%s)" % (a, t[:55], fmt_secs(sec)))
         tot = self.db.q("SELECT SUM(seconds) FROM usage WHERE day=? AND " + SYS_CLAUSE,
                         (today,) + SYSTEM_APPS)
-        lines += ["", "Tracked today: %s" % fmt_secs(tot[0][0] or 0)]
+        idle = self.db.q("SELECT seconds FROM usage WHERE day=? AND LOWER(app)=?",
+                         (today, IDLE_BUCKET))
+        lines += ["", "Tracked today: %s" % fmt_secs(tot[0][0] or 0),
+                  "Idle today: %s" % fmt_secs(idle[0][0] if idle else 0)]
         tk.Label(c, text="\n".join(lines), bg=DARK, fg="white", justify="left", anchor="w",
                  font=("Consolas", 11), wraplength=620).pack(anchor="w")
         tk.Button(c, text="Continue to ContextMind", width=22, bg=ACCENT, fg="white",
@@ -500,6 +549,8 @@ class LockScreen(tk.Toplevel):
                   command=self.close).pack(pady=(16, 0))
 
     def close(self):
+        self._closed = True
+        self._cancel_job()
         try:
             self.grab_release()
         except Exception:
@@ -616,6 +667,7 @@ class App(tk.Tk):
         cards = ttk.Frame(f)
         cards.pack(fill="x", padx=10, pady=10)
         self.lbl_total = self._card(cards, "Tracked today")
+        self.lbl_idle = self._card(cards, "Idle today")
         self.lbl_apps = self._card(cards, "Apps used today")
         self.lbl_now = self._card(cards, "Last active app", small=True)
 
@@ -648,6 +700,9 @@ class App(tk.Tk):
                          " ORDER BY seconds DESC", (today,) + SYSTEM_APPS)
         total = sum(r[1] for r in rows)
         self.lbl_total.config(text=fmt_secs(total))
+        idle = self.db.q("SELECT seconds FROM usage WHERE day=? AND LOWER(app)=?",
+                         (today, IDLE_BUCKET))
+        self.lbl_idle.config(text=fmt_secs(idle[0][0] if idle else 0))
         self.lbl_apps.config(text=str(len(rows)))
         t = self.tracker
         if t.paused:
@@ -901,7 +956,7 @@ class App(tk.Tk):
         self.btn_track = ttk.Button(row, text="Pause tracking", style="Accent.TButton",
                                     command=self.toggle_tracking)
         self.btn_track.pack(side="left")
-        ttk.Label(row, text="   Stop counting after idle (minutes):").pack(side="left")
+        ttk.Label(row, text="   Mark as idle after (minutes):").pack(side="left")
         self.idle_var = tk.IntVar(value=int(self.db.get("idle_minutes", "3")))
         ttk.Spinbox(row, from_=1, to=60, width=4, textvariable=self.idle_var,
                     command=self.set_idle).pack(side="left", padx=4)
