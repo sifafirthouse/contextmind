@@ -2,6 +2,11 @@ name: Build ContextMind
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -11,7 +16,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.8"
+          python-version: "3.11"
 
       - name: Install PyInstaller
         run: pip install pyinstaller pillow
@@ -28,9 +33,17 @@ jobs:
 
       - name: Build EXE
         shell: pwsh
-        run: pyinstaller --noconsole --onefile --name ContextMind "$env:SCRIPT"
+        run: pyinstaller --noconsole --onefile --clean --name ContextMind "$env:SCRIPT"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ContextMind-exe
           path: dist/ContextMind.exe
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ContextMind.exe
+          tag_name: v${{ github.run_number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
