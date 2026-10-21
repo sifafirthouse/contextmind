@@ -38,9 +38,14 @@ ACCENT = "#6c3fc5"
 DARK = "#2e1a5c"
 LIGHT = "#e4d9f7"
 
-# Productivity-la count aagaadha system / helper processes
-SYSTEM_APPS = ("helpandtips.exe", "WerFault.exe", "rundll32.exe", "unknown")
-SYS_CLAUSE = "app NOT IN (%s)" % ",".join("?" * len(SYSTEM_APPS))
+# Productivity-la count aagaadha system / helper / own processes (lowercase)
+SYSTEM_APPS = (
+    "helpandtips.exe", "werfault.exe", "rundll32.exe", "unknown",
+    "taskmgr.exe", "systemsettings.exe", "py.exe", "python.exe",
+    "pythonw.exe", "contextmind.exe",
+)
+SYS_CLAUSE = "LOWER(app) NOT IN (%s)" % ",".join("?" * len(SYSTEM_APPS))
+OWN_APPS = {"contextmind.exe", "python.exe", "pythonw.exe", "py.exe"}
 
 UNLOCK_MAX_FAILS = 5
 UNLOCK_WAIT_SECS = 60
@@ -256,16 +261,18 @@ class Tracker(threading.Thread):
                 if not fg:
                     continue
                 app, title, pid = fg
-                if pid == self.own_pid:  # ignore ContextMind's own windows / lock screen
+                # ContextMind-oda own windows / lock screen / python process skip
+                if pid == self.own_pid or app.lower() in OWN_APPS:
                     continue
                 item = (app, title)
                 self.current = item
                 if not self.recent or self.recent[-1] != item:
                     self.recent.append(item)
                 self.last_active_ts = now
-                self.db.add_usage(date.today().isoformat(), app, dt)
+                today = date.today().isoformat()
+                self.db.add_usage(today, app, dt)
                 if self.track_titles and title.strip():
-                    self.db.add_title(date.today().isoformat(), app, title.strip()[:150], dt)
+                    self.db.add_title(today, app, title.strip()[:150], dt)
                 self._since_save += dt
                 if self._since_save >= 10:
                     self._since_save = 0.0
@@ -573,23 +580,35 @@ class App(tk.Tk):
         self.status_lbl = tk.Label(top, text="", bg=ACCENT, fg="white", font=("Segoe UI", 10))
         self.status_lbl.pack(side="right", padx=14)
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=10, pady=10)
-        self.tab_dash = ttk.Frame(nb)
-        self.tab_cp = ttk.Frame(nb)
-        self.tab_hist = ttk.Frame(nb)
-        self.tab_files = ttk.Frame(nb)
-        self.tab_set = ttk.Frame(nb)
-        nb.add(self.tab_dash, text="Dashboard")
-        nb.add(self.tab_cp, text="Checkpoints")
-        nb.add(self.tab_hist, text="Usage History")
-        nb.add(self.tab_files, text="Files Used")
-        nb.add(self.tab_set, text="Settings")
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=10, pady=10)
+        self.tab_dash = ttk.Frame(self.nb)
+        self.tab_cp = ttk.Frame(self.nb)
+        self.tab_hist = ttk.Frame(self.nb)
+        self.tab_files = ttk.Frame(self.nb)
+        self.tab_set = ttk.Frame(self.nb)
+        self.nb.add(self.tab_dash, text="Dashboard")
+        self.nb.add(self.tab_cp, text="Checkpoints")
+        self.nb.add(self.tab_hist, text="Usage History")
+        self.nb.add(self.tab_files, text="Files Used")
+        self.nb.add(self.tab_set, text="Settings")
         self._build_dash()
         self._build_cp()
         self._build_hist()
         self._build_files()
         self._build_settings()
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab)
+
+    def _on_tab(self, _=None):
+        cur = self.nb.select()
+        if cur == str(self.tab_hist):
+            self.load_history()
+        elif cur == str(self.tab_files):
+            self.load_files()
+        elif cur == str(self.tab_dash):
+            self.refresh_dashboard()
+        elif cur == str(self.tab_cp):
+            self.load_checkpoints()
 
     # Dashboard
     def _build_dash(self):
@@ -611,6 +630,8 @@ class App(tk.Tk):
             self.dash_cp.heading(c, text=c.title())
             self.dash_cp.column(c, width=w, anchor="w")
         self.dash_cp.pack(fill="x", padx=12, pady=6)
+        self.dash_empty = ttk.Label(f, text="No checkpoints yet. Use the Checkpoints tab to add one.",
+                                    foreground="#7a6a9a")
 
     def _card(self, parent, title, small=False):
         box = tk.Frame(parent, bg="white", highlightthickness=1, highlightbackground=LIGHT)
@@ -658,8 +679,13 @@ class App(tk.Tk):
 
         for i in self.dash_cp.get_children():
             self.dash_cp.delete(i)
-        for r in self.db.q("SELECT ts, project, note FROM checkpoints ORDER BY id DESC LIMIT 4"):
+        cp_rows = self.db.q("SELECT ts, project, note FROM checkpoints ORDER BY id DESC LIMIT 4")
+        for r in cp_rows:
             self.dash_cp.insert("", "end", values=(r[0], r[1], r[2].replace("\n", " ")[:90]))
+        if cp_rows:
+            self.dash_empty.place_forget()
+        else:
+            self.dash_empty.place(in_=self.dash_cp, relx=0.5, rely=0.5, anchor="center")
 
     # Checkpoints
     def _build_cp(self):
@@ -695,6 +721,8 @@ class App(tk.Tk):
             self.cp_tree.column(c, width=w, anchor="w")
         self.cp_tree.pack(fill="both", expand=True, padx=12, pady=8)
         self.cp_tree.bind("<Double-1>", lambda e: self.open_checkpoint())
+        self.cp_empty = ttk.Label(f, text="No checkpoints yet. Fill the form above and click Save.",
+                                  foreground="#7a6a9a")
         self.load_checkpoints()
 
     def save_checkpoint(self):
@@ -724,6 +752,14 @@ class App(tk.Tk):
             (s, s, s, s, s))
         for r in rows:
             self.cp_tree.insert("", "end", values=(r[0], r[1], r[2], r[3].replace("\n", " ")[:100]))
+        if rows:
+            self.cp_empty.place_forget()
+        elif self.cp_search.get().strip():
+            self.cp_empty.config(text="No checkpoints match this search.")
+            self.cp_empty.place(in_=self.cp_tree, relx=0.5, rely=0.5, anchor="center")
+        else:
+            self.cp_empty.config(text="No checkpoints yet. Fill the form above and click Save.")
+            self.cp_empty.place(in_=self.cp_tree, relx=0.5, rely=0.5, anchor="center")
 
     def _selected_cp(self):
         sel = self.cp_tree.selection()
@@ -1018,10 +1054,10 @@ class App(tk.Tk):
             if reason == "manual":
                 messagebox.showinfo("ContextMind", "Please set a password first.")
             return
-        if reason == "startup":
-            snap = self.prev_last
-        else:
-            snap = self.tracker.snapshot() or self.prev_last
+        snap = self.prev_last if reason == "startup" else (self.tracker.snapshot() or self.prev_last)
+        was_normal = self.state() == "normal"
+
+        self.withdraw()  # dashboard lock nerathula hide
 
         def done():
             self.lock_win = None
@@ -1029,14 +1065,15 @@ class App(tk.Tk):
                 self.deiconify()
                 if self.minimized:
                     self.iconify()
+            elif was_normal:
+                self.deiconify()
 
         try:
             self.lock_win = LockScreen(self, reason, snap, done)
         except Exception:
             logging.exception("show_lock")
             self.lock_win = None
-            if reason == "startup":  # never leave the user without a window
-                self.deiconify()
+            self.deiconify()
 
     # export / backup
     def _save_dialog(self, name, ext):
@@ -1104,6 +1141,12 @@ class App(tk.Tk):
     def _tick(self):
         try:
             self._n += 1
+            if self.lock_win is not None:
+                try:
+                    self.lock_win.lift()
+                    self.lock_win.attributes("-topmost", True)
+                except tk.TclError:
+                    self.lock_win = None
             if (self.lock_win is None and self.db.get("lock_idle", "1") == "1"
                     and self.db.has_password()):
                 limit = int(self.db.get("lock_idle_minutes", "2")) * 60
